@@ -1,9 +1,17 @@
+#!/usr/bin/env python3
 import asyncio
+from contextlib import ExitStack
 import os
+import random
+import resource
+import socket
 import sys
 import textwrap
 
 from echoutil import realtime_status, set_socket_io_timeouts, verbose
+
+
+RETRIES = 10
 
 
 class EchoClient(asyncio.Protocol):
@@ -68,11 +76,43 @@ class EchoClient(asyncio.Protocol):
         verbose(self.id, 'Sent:', chunk)
 
 
-async def wait_until_done(connection):
-    """Waits for both the connection to be open and the entire workload to be
-    processed."""
-    transport, protocol = await connection
-    await protocol.done
+async def wait_until_done(loop, factory, jitter):
+    """Waits for the connection to open and the workload to be processed.
+
+    Note: there's retry logic to make sure we're connecting even in
+    the face of momentary ECONNRESET on the server-side.
+
+    Note: there's a manual socket passed to `create_connection` to
+    circumvent the need to use domain name lookup. If faced with actual
+    domain name lookup, do the same, awaiting on aiodns' resolver query.
+    Don't use the builtin threadpool-based resolver.
+
+    Note: We're adding the socket to be automatically closed by the exit
+    stack. This cleans up all resources regardless of the contol flow.
+    """
+    await asyncio.sleep(jitter)
+    retries = RETRIES * [1]  # non-exponential 10s
+    with ExitStack() as stack:
+        while True:
+            try:
+                sock = stack.enter_context(socket.socket())
+                sock.connect(('127.0.0.1', 8888))
+                connection = loop.create_connection(factory, sock=sock)
+                transport, protocol = await connection
+            except Exception as e:
+                if not retries:
+                    raise
+                await asyncio.sleep(retries.pop(0) - random.random())
+            else:
+                break
+        await protocol.done
+    return len(retries)
+
+
+def get_connected_socket():
+    sock = socket.socket()
+    sock.connect(('127.0.0.1', 8888))
+    return sock
 
 
 def main(how_many_connections):
@@ -89,15 +129,17 @@ def main(how_many_connections):
         ),
     )
     loop = asyncio.get_event_loop()
+    max_files = resource.getrlimit(resource.RLIMIT_NOFILE)[0]  # ulimit -n
+    # Note: Increasing the divisor below will decrease the number of retries
+    # but also decrease achievable concurrency.
+    how_many_connections_per_second = min(max_files, how_many_connections) // 5
     tasks = [
         wait_until_done(
-            loop.create_connection(
-                lambda: EchoClient(data),
-                'localhost',
-                8888,
-            ),
+            loop,
+            lambda: EchoClient(data),
+            jitter / how_many_connections_per_second,
         )
-        for _ in range(how_many_connections)
+        for jitter in range(how_many_connections)
     ]
     load_test = loop.create_task(asyncio.wait(tasks))
     monitor = loop.create_task(realtime_status(EchoClient, load_test))
@@ -109,7 +151,17 @@ def main(how_many_connections):
         if load_test.done():
             done, _ = load_test.result()
             exceptions = sum(1 for d in done if d.exception())
-            print("{} tasks, {} exceptions".format(len(tasks), exceptions))
+            retries = sum(
+                RETRIES - d.result()
+                for d in done if not d.exception()
+            )
+            print(
+                "{} tasks, {} exceptions, {} retries".format(
+                    len(tasks),
+                    exceptions,
+                    retries,
+                ),
+            )
         loop.close()
 
 
